@@ -75,6 +75,7 @@ import { fetchConflictEvents, fetchUcdpClassifications, fetchHapiSummary, fetchU
 import { fetchUnhcrPopulation } from '@/services/displacement';
 import { fetchClimateAnomalies } from '@/services/climate';
 import { fetchSecurityAdvisories } from '@/services/security-advisories';
+import { fetchZeroClickOffers } from '@/services/zeroclick';
 import { fetchTelegramFeed } from '@/services/telegram-intel';
 import { fetchOrefAlerts, startOrefPolling, stopOrefPolling, onOrefAlertsUpdate } from '@/services/oref-alerts';
 import { enrichEventsWithExposure } from '@/services/population-exposure';
@@ -1469,6 +1470,9 @@ export class DataLoaderManager implements AppModule {
     // Telegram Intel
     tasks.push(this.loadTelegramIntel());
 
+    // ZeroClick Offers
+    tasks.push(this.loadZeroClickOffers());
+
     // OREF sirens
     tasks.push((async () => {
       try {
@@ -2402,6 +2406,15 @@ export class DataLoaderManager implements AppModule {
       this.callPanel('telegram-intel', 'setData', result);
     } catch (error) {
       console.error('[App] Telegram intel fetch failed:', error);
+    }
+  }
+
+  async loadZeroClickOffers(): Promise<void> {
+    try {
+      const offers = await fetchZeroClickOffers('intelligence security geopolitics', 5);
+      this.callPanel('zeroclick-offers', 'setData', offers);
+    } catch (error) {
+      console.error('[App] ZeroClick offers fetch failed:', error);
     }
   }
 }

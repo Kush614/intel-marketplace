@@ -1,4 +1,4 @@
-import { defineConfig, type Plugin } from 'vite';
+import { defineConfig, loadEnv, type Plugin } from 'vite';
 import { VitePWA } from 'vite-plugin-pwa';
 import { resolve, dirname, extname } from 'path';
 import { mkdir, readFile, writeFile } from 'fs/promises';
@@ -7,6 +7,12 @@ import { promisify } from 'util';
 import pkg from './package.json';
 import { VARIANT_META } from './src/config/variant-meta';
 import { PROXY_ROUTES, APIFY_ENV_KEYS, CACHE_TTLS, type ProxyRoute } from './src/services/apify-config';
+
+// Load .env.local into process.env before plugins run
+const _env = loadEnv(process.env.NODE_ENV || 'development', process.cwd(), '');
+for (const [key, val] of Object.entries(_env)) {
+  if (!(key in process.env)) process.env[key] = val;
+}
 
 const isE2E = process.env.VITE_E2E === '1';
 const isDesktopBuild = process.env.VITE_DESKTOP_RUNTIME === '1';

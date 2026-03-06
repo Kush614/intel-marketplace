@@ -58,6 +58,7 @@ export interface PanelLayoutCallbacks {
   loadAllData: () => Promise<void>;
   updateMonitorResults: () => void;
   loadSecurityAdvisories?: () => Promise<void>;
+  loadZeroClickOffers?: () => Promise<void>;
 }
 
 export class PanelLayoutManager implements AppModule {
@@ -728,6 +729,14 @@ export class PanelLayoutManager implements AppModule {
 
       this.lazyPanel('telegram-intel', () =>
         import('@/components/TelegramIntelPanel').then(m => new m.TelegramIntelPanel()),
+      );
+
+      this.lazyPanel('zeroclick-offers', () =>
+        import('@/components/ZeroClickOffersPanel').then(m => {
+          const p = new m.ZeroClickOffersPanel();
+          p.setRefreshHandler(() => { void this.callbacks.loadZeroClickOffers?.(); });
+          return p;
+        }),
       );
     }
 

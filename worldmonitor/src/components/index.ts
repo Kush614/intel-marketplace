@@ -49,3 +49,4 @@ export * from './GulfEconomiesPanel';
 export * from './WorldClockPanel';
 export { AirlineIntelPanel } from './AirlineIntelPanel';
 export { AviationCommandBar } from './AviationCommandBar';
+export { ZeroClickOffersPanel } from './ZeroClickOffersPanel';
