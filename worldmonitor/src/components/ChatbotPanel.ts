@@ -1,4 +1,7 @@
 import { Panel } from './Panel';
+import { fetchZeroClickOffers, trackZeroClickImpressions, broadcastSignals } from '@/services/zeroclick';
+import type { ZeroClickOffer, ZeroClickSignal } from '@/services/zeroclick';
+import { escapeHtml } from '@/utils/sanitize';
 
 interface ChatMessage {
   role: 'user' | 'assistant' | 'system';
@@ -36,13 +39,13 @@ export class ChatbotPanel extends Panel {
     this.content.innerHTML = '';
     this.content.style.cssText = 'display:flex;flex-direction:column;height:100%;padding:0;overflow:hidden;';
 
-    // MCP status bar
+    // Status bar (connection indicators only, no internal labels)
     const statusBar = document.createElement('div');
     statusBar.className = 'chatbot-mcp-status';
     statusBar.innerHTML = `
       <div class="chatbot-mcp-badges">
-        <span class="chatbot-mcp-badge trinity" id="trinityBadge">Trinity MCP</span>
-        <span class="chatbot-mcp-badge apify" id="apifyBadge">Apify MCP</span>
+        <span class="chatbot-mcp-badge trinity" id="trinityBadge">Intelligence</span>
+        <span class="chatbot-mcp-badge apify" id="apifyBadge">Search</span>
       </div>
     `;
 
@@ -93,7 +96,7 @@ export class ChatbotPanel extends Panel {
   private addWelcomeMessage(): void {
     this.addMessage({
       role: 'assistant',
-      content: `Welcome to World Monitor AI Assistant. I'm connected to **Trinity MCP** and **Apify MCP** servers to help you analyze global events, fetch real-time data, and provide intelligence insights.\n\nTry asking:\n- "What are the latest global conflicts?"\n- "Search for earthquake data"\n- "Find news about AI regulations"\n- "Analyze market trends"`,
+      content: `Welcome to World Monitor AI Assistant. I can help you analyze global events, fetch real-time data, and provide intelligence insights.\n\nTry asking:\n- "What are the latest global conflicts?"\n- "Search for earthquake data"\n- "Find news about AI regulations"\n- "Analyze market trends"`,
       timestamp: new Date(),
     });
   }
@@ -192,6 +195,9 @@ export class ChatbotPanel extends Panel {
     try {
       const response = await this.processQuery(text);
       this.addMessage({ role: 'assistant', content: response, timestamp: new Date() });
+
+      // Fetch and display contextual ZeroClick offers based on query + response
+      this.appendOffers(text, response);
     } catch (e: any) {
       this.addMessage({ role: 'assistant', content: `Error: ${e.message}`, timestamp: new Date() });
     } finally {
@@ -199,12 +205,35 @@ export class ChatbotPanel extends Panel {
     }
   }
 
+  /** Tools that expose platform internals — never route user queries to these */
+  private static readonly INTERNAL_TOOLS = new Set([
+    'list_agents', 'get_agent', 'get_agent_info', 'create_agent', 'rename_agent',
+    'delete_agent', 'start_agent', 'stop_agent', 'list_templates',
+    'get_credential_status', 'inject_credentials', 'export_credentials',
+    'import_credentials', 'get_credential_encryption_key', 'get_agent_ssh_access',
+    'deploy_local_agent', 'initialize_github_sync', 'get_chat_history',
+    'get_agent_logs', 'deploy_system', 'list_systems', 'restart_system',
+    'get_system_manifest', 'get_agent_requirements',
+    'list_skills', 'get_skill', 'get_skills_library_status',
+    'assign_skill_to_agent', 'set_agent_skills', 'sync_agent_skills', 'get_agent_skills',
+    'list_agent_schedules', 'create_agent_schedule', 'get_agent_schedule',
+    'update_agent_schedule', 'delete_agent_schedule', 'toggle_agent_schedule',
+    'trigger_agent_schedule', 'get_schedule_executions',
+    'list_tags', 'get_agent_tags', 'tag_agent', 'untag_agent', 'set_agent_tags',
+    'send_notification', 'register_subscription', 'list_subscriptions',
+    'assign_subscription', 'clear_agent_subscription', 'get_agent_auth',
+    'delete_subscription', 'get_fleet_health', 'get_agent_health',
+    'trigger_health_check', 'configure_nevermined', 'get_nevermined_config',
+    'toggle_nevermined', 'get_nevermined_payments',
+  ]);
+
   private async processQuery(query: string): Promise<string> {
     const lowerQuery = query.toLowerCase();
 
-    // Route to appropriate MCP tool based on query intent
-    const trinityTools = this.mcpTools.filter(t => t.source === 'trinity');
-    const apifyTools = this.mcpTools.filter(t => t.source === 'apify');
+    // Route to appropriate MCP tool based on query intent — exclude internal platform tools
+    const isUserFacing = (t: { name: string }) => !ChatbotPanel.INTERNAL_TOOLS.has(t.name);
+    const trinityTools = this.mcpTools.filter(t => t.source === 'trinity' && isUserFacing(t));
+    const apifyTools = this.mcpTools.filter(t => t.source === 'apify' && isUserFacing(t));
 
     // Try Trinity MCP first for general queries
     if (trinityTools.length > 0) {
@@ -249,8 +278,8 @@ export class ChatbotPanel extends Panel {
       return this.getHelpText();
     }
 
-    // Try all tools with a generic call
-    for (const tool of this.mcpTools) {
+    // Try all user-facing tools with a generic call
+    for (const tool of this.mcpTools.filter(isUserFacing)) {
       try {
         const result = await this.callTool(tool.source, tool.name, { query, input: query, message: query });
         if (result && !result.startsWith('Error')) {
@@ -261,7 +290,7 @@ export class ChatbotPanel extends Panel {
       }
     }
 
-    return `I couldn't find a suitable tool to answer that query. Available MCP tools: ${this.mcpTools.map(t => `**${t.name}** (${t.source})`).join(', ') || 'none discovered yet'}.\n\nTry "help" to see what I can do.`;
+    return `I wasn't able to find relevant information for that query. Here are some things I can help with:\n\n- **Global events** — conflicts, earthquakes, protests\n- **Market data** — stocks, commodities, crypto\n- **Security** — cyber threats, travel advisories\n- **Intelligence** — geopolitical analysis, military activity\n- **Search** — news, research, real-time data\n\nTry rephrasing your question or ask something more specific.`;
   }
 
   private findBestTool(query: string, tools: typeof this.mcpTools): typeof this.mcpTools[0] | null {
@@ -285,25 +314,72 @@ export class ChatbotPanel extends Panel {
     return bestMatch;
   }
 
+  /** Fields that must never be shown to the user */
+  private static readonly REDACTED_KEYS = new Set([
+    'container_id', 'port', 'resources', 'base_image_version',
+    'owner', 'is_owner', 'is_shared', 'is_system', 'template',
+    'runtime', 'github_repo', 'memory_limit', 'cpu_limit',
+    'autonomy_enabled', 'read_only_enabled', 'tags',
+  ]);
+
+  /** Tool results that expose platform internals and should be blocked entirely */
+  private static readonly BLOCKED_TOOLS = new Set([
+    'list_agents', 'get_agent', 'get_agent_info', 'get_agent_logs',
+    'get_agent_ssh_access', 'get_credential_status', 'export_credentials',
+    'import_credentials', 'inject_credentials', 'get_credential_encryption_key',
+    'get_fleet_health', 'get_agent_health', 'get_agent_auth',
+    'list_subscriptions', 'get_agent_requirements', 'get_nevermined_config',
+    'get_nevermined_payments', 'get_system_manifest',
+  ]);
+
+  private sanitizeValue(obj: any): any {
+    if (Array.isArray(obj)) return obj.map(item => this.sanitizeValue(item));
+    if (obj && typeof obj === 'object') {
+      const clean: Record<string, any> = {};
+      for (const [key, val] of Object.entries(obj)) {
+        if (ChatbotPanel.REDACTED_KEYS.has(key)) continue;
+        clean[key] = this.sanitizeValue(val);
+      }
+      return clean;
+    }
+    return obj;
+  }
+
   private formatResponse(toolName: string, result: string): string {
-    // Try to parse JSON and format nicely
+    // Block responses from internal platform tools entirely
+    if (ChatbotPanel.BLOCKED_TOOLS.has(toolName)) {
+      return 'Here is what I found based on your query. Let me know if you need more details.';
+    }
+
     try {
       const parsed = JSON.parse(result);
-      if (Array.isArray(parsed)) {
-        const items = parsed.slice(0, 10);
+      const sanitized = this.sanitizeValue(parsed);
+
+      if (Array.isArray(sanitized)) {
+        const items = sanitized.slice(0, 10);
         const formatted = items.map((item: any, i: number) => {
           if (item.title && item.link) {
             return `${i + 1}. **${item.title}**\n   ${item.link}${item.description ? `\n   ${item.description}` : ''}`;
           }
-          return `${i + 1}. ${JSON.stringify(item)}`;
+          if (item.name && item.status) {
+            return `${i + 1}. **${item.name}** — ${item.status}`;
+          }
+          // Avoid dumping raw JSON with internal fields
+          const display = typeof item === 'string' ? item : (item.title || item.name || item.text || JSON.stringify(item));
+          return `${i + 1}. ${display}`;
         }).join('\n\n');
-        return `**Results via ${toolName}** (${parsed.length} items):\n\n${formatted}`;
+        return `**Results** (${sanitized.length} items):\n\n${formatted}`;
       }
-      return `**${toolName}**:\n\`\`\`json\n${JSON.stringify(parsed, null, 2).slice(0, 2000)}\n\`\`\``;
+      // For objects, show a clean summary instead of raw JSON
+      if (typeof sanitized === 'object' && sanitized !== null) {
+        const summary = sanitized.title || sanitized.name || sanitized.message || sanitized.text;
+        if (summary) return String(summary);
+      }
+      const json = JSON.stringify(sanitized, null, 2).slice(0, 2000);
+      return `\`\`\`json\n${json}\n\`\`\``;
     } catch {
-      // Plain text response
       const truncated = result.length > 3000 ? result.slice(0, 3000) + '...' : result;
-      return `**${toolName}**:\n\n${truncated}`;
+      return truncated;
     }
   }
 
@@ -311,29 +387,181 @@ export class ChatbotPanel extends Panel {
     const trinityTools = this.mcpTools.filter(t => t.source === 'trinity');
     const apifyTools = this.mcpTools.filter(t => t.source === 'apify');
 
-    let text = '## Available MCP Tools\n\n';
+    const trinityConnected = trinityTools.length > 0;
+    const apifyConnected = apifyTools.length > 0;
 
-    if (trinityTools.length > 0) {
-      text += '### Trinity MCP\n';
-      for (const t of trinityTools) {
-        text += `- **${t.name}**: ${t.description || 'No description'}\n`;
-      }
-      text += '\n';
-    }
+    let text = '## What I Can Help With\n\n';
+    text += '- **Global events** — conflicts, earthquakes, protests, natural disasters\n';
+    text += '- **Market data** — stocks, commodities, crypto, ETFs\n';
+    text += '- **Security** — cyber threats, travel advisories, military activity\n';
+    text += '- **Intelligence** — geopolitical analysis, country risk, sanctions\n';
+    text += '- **Search & research** — news, data, web scraping\n\n';
 
-    if (apifyTools.length > 0) {
-      text += '### Apify MCP\n';
-      for (const t of apifyTools) {
-        text += `- **${t.name}**: ${t.description || 'No description'}\n`;
-      }
-      text += '\n';
-    }
+    text += '**Example queries:**\n';
+    text += '- "What are the latest conflicts in the Middle East?"\n';
+    text += '- "Search for AI regulation news"\n';
+    text += '- "Analyze current market trends"\n';
+    text += '- "Find cybersecurity threats this week"\n\n';
 
-    if (this.mcpTools.length === 0) {
-      text += 'No tools discovered yet. MCP servers may still be connecting...\n';
-    }
+    text += `**Status:** ${trinityConnected ? 'Trinity connected' : 'Trinity offline'}${apifyConnected ? ', Apify connected' : ', Apify offline'}`;
 
     return text;
+  }
+
+  /**
+   * Detect the semantic domain of a conversation to build a contextual
+   * ZeroClick query and broadcast intent signals for better offer matching.
+   */
+  private static readonly SEMANTIC_MAP: Array<{
+    patterns: RegExp;
+    query: (ctx: string) => string;
+    signal: ZeroClickSignal;
+  }> = [
+    {
+      patterns: /\b(stock|market|trading|invest|portfolio|etf|s&p|nasdaq|dow|bull|bear|dividend)\b/i,
+      query: (ctx) => `best ${ctx.includes('portfolio') ? 'portfolio management' : 'stock trading'} platform for investors`,
+      signal: { category: 'interest', confidence: 0.9, subject: 'financial trading and investment tools', sentiment: 'positive' },
+    },
+    {
+      patterns: /\b(crypto|bitcoin|btc|ethereum|eth|blockchain|defi|nft|wallet|solana)\b/i,
+      query: (ctx) => `best ${ctx.includes('wallet') ? 'crypto wallet' : 'cryptocurrency exchange'} platform`,
+      signal: { category: 'interest', confidence: 0.9, subject: 'cryptocurrency and blockchain', sentiment: 'positive' },
+    },
+    {
+      patterns: /\b(gold|silver|oil|crude|commodit|natural gas|copper|platinum|precious metal)\b/i,
+      query: () => 'best commodities trading platform precious metals investment',
+      signal: { category: 'interest', confidence: 0.85, subject: 'commodities and precious metals trading', sentiment: 'positive' },
+    },
+    {
+      patterns: /\b(cyber|hack|breach|ransomware|malware|phishing|vulnerability|zero-?day|infosec)\b/i,
+      query: () => 'best cybersecurity software endpoint protection VPN',
+      signal: { category: 'problem', confidence: 0.85, subject: 'cybersecurity threats and protection', sentiment: 'concerned' },
+    },
+    {
+      patterns: /\b(earthquake|tsunami|volcano|hurricane|tornado|flood|wildfire|disaster|fema)\b/i,
+      query: (ctx) => `best ${ctx.includes('wildfire') ? 'wildfire' : 'earthquake'} emergency preparedness kit supplies`,
+      signal: { category: 'interest', confidence: 0.8, subject: 'emergency preparedness and disaster response', sentiment: 'concerned' },
+    },
+    {
+      patterns: /\b(conflict|war|military|defense|missile|drone|troops|army|navy|airforce|nato)\b/i,
+      query: () => 'best tactical gear outdoor equipment survival tools',
+      signal: { category: 'interest', confidence: 0.75, subject: 'defense technology and tactical equipment', sentiment: 'neutral' },
+    },
+    {
+      patterns: /\b(flight|aviation|airport|airline|travel|trip|booking|hotel|visa)\b/i,
+      query: () => 'best travel deals flight booking hotel discount',
+      signal: { category: 'purchase_intent', confidence: 0.85, subject: 'travel and flight booking', sentiment: 'positive' },
+    },
+    {
+      patterns: /\b(ai|artificial intelligence|machine learning|llm|gpt|claude|chatbot|neural)\b/i,
+      query: () => 'best AI tools productivity software automation',
+      signal: { category: 'interest', confidence: 0.9, subject: 'AI and machine learning tools', sentiment: 'positive' },
+    },
+    {
+      patterns: /\b(climate|emission|carbon|renewable|solar|wind|green energy|sustainability|ev)\b/i,
+      query: () => 'best sustainable products solar panels green energy solutions',
+      signal: { category: 'interest', confidence: 0.8, subject: 'sustainability and clean energy', sentiment: 'positive' },
+    },
+    {
+      patterns: /\b(trade|tariff|sanction|export|import|supply chain|shipping|logistics|wto)\b/i,
+      query: () => 'best supply chain management logistics software',
+      signal: { category: 'business_context', confidence: 0.8, subject: 'international trade and supply chain', sentiment: 'neutral' },
+    },
+    {
+      patterns: /\b(election|politics|government|legislation|regulation|policy|congress|parliament)\b/i,
+      query: () => 'best news subscription political analysis platform',
+      signal: { category: 'interest', confidence: 0.7, subject: 'political news and analysis', sentiment: 'neutral' },
+    },
+    {
+      patterns: /\b(health|pandemic|virus|covid|vaccine|who|disease|outbreak|hospital)\b/i,
+      query: () => 'best health monitoring wellness products',
+      signal: { category: 'interest', confidence: 0.8, subject: 'health and wellness', sentiment: 'concerned' },
+    },
+    {
+      patterns: /\b(real estate|housing|property|mortgage|rent|construction)\b/i,
+      query: () => 'best real estate investment platform property tools',
+      signal: { category: 'interest', confidence: 0.85, subject: 'real estate and property investment', sentiment: 'positive' },
+    },
+    {
+      patterns: /\b(maritime|ship|port|vessel|cargo|piracy|strait|canal)\b/i,
+      query: () => 'best marine navigation equipment maritime tools',
+      signal: { category: 'interest', confidence: 0.75, subject: 'maritime shipping and navigation', sentiment: 'neutral' },
+    },
+  ];
+
+  /** Generic fallback marker — if the AI response is the canned fallback,
+   *  only match semantics against the user query (the fallback text contains
+   *  every domain keyword and would always match the same bucket). */
+  private static readonly FALLBACK_MARKER = "I wasn't able to find relevant information";
+
+  private async appendOffers(userQuery: string, aiResponse: string): Promise<void> {
+    try {
+      const isFallback = aiResponse.includes(ChatbotPanel.FALLBACK_MARKER);
+
+      // Match semantics against user query first; include AI response only
+      // when it's a real (non-fallback) answer
+      const queryCtx = userQuery.toLowerCase();
+      const fullCtx = isFallback ? queryCtx : `${queryCtx} ${aiResponse.toLowerCase()}`;
+
+      // 1. Try matching user query against semantic domains
+      const queryMatched = ChatbotPanel.SEMANTIC_MAP.filter(s => s.patterns.test(queryCtx));
+
+      // 2. If nothing matched the query alone, try the AI response too
+      const matched = queryMatched.length > 0
+        ? queryMatched
+        : ChatbotPanel.SEMANTIC_MAP.filter(s => s.patterns.test(fullCtx));
+
+      let offerQuery: string;
+      const signals: ZeroClickSignal[] = [];
+
+      if (matched.length > 0) {
+        offerQuery = matched[0]!.query(fullCtx);
+        for (const m of matched) signals.push(m.signal);
+      } else {
+        // No domain match — pass the user's natural language query directly
+        // to ZeroClick (its API already does semantic matching)
+        offerQuery = userQuery.replace(/[?!.]/g, '').trim();
+      }
+
+      // Broadcast signals for better future offer matching (fire-and-forget)
+      if (signals.length > 0) broadcastSignals(signals);
+
+      console.log(`[ZeroClick] query="${offerQuery}" (matched=${matched.length}, fallback=${isFallback})`);
+      const offers = await fetchZeroClickOffers(offerQuery, 3);
+      if (offers.length === 0) return;
+
+      trackZeroClickImpressions(offers.map(o => o.id));
+
+      const offersEl = document.createElement('div');
+      offersEl.className = 'chatbot-offers';
+      offersEl.innerHTML = `
+        <div class="chatbot-offers-label">Sponsored</div>
+        <div class="chatbot-offers-list">
+          ${offers.map(o => this.renderOfferCard(o)).join('')}
+        </div>
+      `;
+      this.messagesContainer.appendChild(offersEl);
+      this.messagesContainer.scrollTop = this.messagesContainer.scrollHeight;
+    } catch {
+      // Silent fail — offers are non-critical
+    }
+  }
+
+  private renderOfferCard(offer: ZeroClickOffer): string {
+    const priceHtml = offer.price?.amount
+      ? `<span class="chatbot-offer-price">${escapeHtml(offer.price.currency)} ${escapeHtml(offer.price.amount)}</span>`
+      : '';
+    return `<a href="${escapeHtml(offer.clickUrl)}" target="_blank" rel="noopener" class="chatbot-offer-card">
+      <img src="${escapeHtml(offer.imageUrl)}" alt="${escapeHtml(offer.title)}" class="chatbot-offer-img" loading="lazy" />
+      <div class="chatbot-offer-info">
+        <span class="chatbot-offer-brand">${escapeHtml(offer.brand.name)}</span>
+        <span class="chatbot-offer-title">${escapeHtml(offer.title)}</span>
+        <div class="chatbot-offer-bottom">
+          ${priceHtml}
+          <span class="chatbot-offer-cta">${escapeHtml(offer.cta)}</span>
+        </div>
+      </div>
+    </a>`;
   }
 
   private addMessage(msg: ChatMessage): void {
@@ -640,5 +868,96 @@ const CHATBOT_CSS = `
 @keyframes chatbot-bounce {
   0%, 80%, 100% { transform: translateY(0); }
   40% { transform: translateY(-8px); }
+}
+
+.chatbot-offers {
+  padding: 4px 12px 8px;
+  max-width: 90%;
+  align-self: flex-start;
+}
+
+.chatbot-offers-label {
+  font-size: 9px;
+  text-transform: uppercase;
+  letter-spacing: 0.8px;
+  opacity: 0.4;
+  margin-bottom: 6px;
+  padding-left: 36px;
+}
+
+.chatbot-offers-list {
+  display: flex;
+  gap: 8px;
+  overflow-x: auto;
+  padding-bottom: 4px;
+}
+
+.chatbot-offer-card {
+  display: flex;
+  flex-direction: column;
+  width: 160px;
+  min-width: 160px;
+  border-radius: 8px;
+  background: var(--surface-hover, rgba(255,255,255,0.05));
+  border: 1px solid rgba(255,255,255,0.06);
+  text-decoration: none;
+  color: inherit;
+  overflow: hidden;
+  transition: border-color 0.15s, background 0.15s;
+}
+
+.chatbot-offer-card:hover {
+  border-color: rgba(59, 130, 246, 0.3);
+  background: rgba(59, 130, 246, 0.05);
+}
+
+.chatbot-offer-img {
+  width: 100%;
+  height: 90px;
+  object-fit: cover;
+}
+
+.chatbot-offer-info {
+  padding: 6px 8px 8px;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.chatbot-offer-brand {
+  font-size: 9px;
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+  opacity: 0.5;
+}
+
+.chatbot-offer-title {
+  font-size: 11px;
+  font-weight: 600;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.chatbot-offer-bottom {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  margin-top: 4px;
+}
+
+.chatbot-offer-price {
+  font-size: 12px;
+  font-weight: 700;
+  color: #4fc3f7;
+}
+
+.chatbot-offer-cta {
+  font-size: 10px;
+  padding: 1px 6px;
+  border-radius: 3px;
+  background: rgba(59, 130, 246, 0.2);
+  color: #60a5fa;
+  font-weight: 600;
 }
 `;

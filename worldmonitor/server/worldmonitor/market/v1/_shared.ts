@@ -60,7 +60,232 @@ export async function fetchYahooQuotesBatch(
     }
     if (consecutiveFails >= 5) break;
   }
+
+  // Fallback: Apify Yahoo Finance actor for any missing symbols
+  const missing = symbols.filter(s => !results.has(s));
+  if (missing.length > 0) {
+    const apifyResults = await fetchViaApifyYahoo(missing);
+    for (const [sym, data] of apifyResults) {
+      results.set(sym, data);
+      rateLimitHits = Math.max(0, rateLimitHits - 1);
+    }
+  }
+
+  // Fallback: Apify Cheerio proxy for symbols still missing (futures, commodities, etc.)
+  const stillMissing = symbols.filter(s => !results.has(s));
+  if (stillMissing.length > 0) {
+    const cheerioResults = await fetchViaApifyCheerio(stillMissing);
+    for (const [sym, data] of cheerioResults) {
+      results.set(sym, data);
+      rateLimitHits = Math.max(0, rateLimitHits - 1);
+    }
+  }
+
+  // Fallback: Google Finance for indices still missing after all Apify attempts
+  const finalMissing = symbols.filter(s => !results.has(s) && GOOGLE_FINANCE_MAP[s]);
+  if (finalMissing.length > 0) {
+    const gfResults = await fetchGoogleFinanceBatch(finalMissing);
+    for (const [sym, data] of gfResults) {
+      results.set(sym, data);
+      rateLimitHits = Math.max(0, rateLimitHits - 1);
+    }
+  }
+
   return { results, rateLimited: rateLimitHits > symbols.length / 2 };
+}
+
+// ========================================================================
+// Apify Yahoo Finance fallback (architjn/yahoo-finance actor)
+// ========================================================================
+
+interface ApifyYahooItem {
+  ticker: string;
+  price_info?: {
+    symbol: string;
+    current_price: number;
+    previous_close: number;
+    change: number;
+    change_percent: number;
+  };
+  history?: {
+    data?: Array<{ close: number }>;
+  };
+}
+
+const apifyCache = new Map<string, { data: Map<string, { price: number; change: number; sparkline: number[] }>; ts: number }>();
+const APIFY_CACHE_TTL = 5 * 60_000; // 5 min
+
+async function fetchViaApifyYahoo(
+  symbols: string[],
+): Promise<Map<string, { price: number; change: number; sparkline: number[] }>> {
+  const results = new Map<string, { price: number; change: number; sparkline: number[] }>();
+  const token = process.env.VITE_APIFY_TOKEN;
+  if (!token) return results;
+
+  // Check cache
+  const cacheKey = [...symbols].sort().join(',');
+  const cached = apifyCache.get(cacheKey);
+  if (cached && Date.now() - cached.ts < APIFY_CACHE_TTL) return cached.data;
+
+  try {
+    const url = `https://api.apify.com/v2/acts/architjn~yahoo-finance/run-sync-get-dataset-items?token=${token}&timeout=45`;
+    const resp = await fetch(url, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ tickers: symbols }),
+      signal: AbortSignal.timeout(50_000),
+    });
+    if (!resp.ok) {
+      console.warn(`[Apify Yahoo] HTTP ${resp.status}`);
+      return results;
+    }
+
+    const items: ApifyYahooItem[] = await resp.json();
+    for (const item of items) {
+      const sym = item.ticker;
+      const pi = item.price_info;
+      if (!pi || !pi.current_price) continue;
+
+      const sparkline = item.history?.data
+        ?.slice(-30)
+        .map(d => d.close)
+        .filter((v): v is number => v != null) ?? [];
+
+      results.set(sym, {
+        price: pi.current_price,
+        change: pi.change_percent ?? 0,
+        sparkline,
+      });
+    }
+    console.log(`[Apify Yahoo] Fetched ${results.size}/${symbols.length} quotes`);
+    apifyCache.set(cacheKey, { data: results, ts: Date.now() });
+  } catch (err) {
+    console.warn(`[Apify Yahoo] Error:`, (err as Error).message);
+  }
+
+  return results;
+}
+
+// ========================================================================
+// Apify Cheerio proxy fallback (Yahoo v8 chart via Apify's IPs)
+// ========================================================================
+
+const cheerioCache = new Map<string, { data: Map<string, { price: number; change: number; sparkline: number[] }>; ts: number }>();
+const CHEERIO_CACHE_TTL = 5 * 60_000; // 5 min
+
+async function fetchViaApifyCheerio(
+  symbols: string[],
+): Promise<Map<string, { price: number; change: number; sparkline: number[] }>> {
+  const results = new Map<string, { price: number; change: number; sparkline: number[] }>();
+  const token = process.env.VITE_APIFY_TOKEN;
+  if (!token || symbols.length === 0) return results;
+
+  const cacheKey = [...symbols].sort().join(',');
+  const cached = cheerioCache.get(cacheKey);
+  if (cached && Date.now() - cached.ts < CHEERIO_CACHE_TTL) return cached.data;
+
+  try {
+    const startUrls = symbols.map(s => ({
+      url: `https://query1.finance.yahoo.com/v8/finance/chart/${encodeURIComponent(s)}`,
+    }));
+
+    const url = `https://api.apify.com/v2/acts/apify~cheerio-scraper/run-sync-get-dataset-items?token=${token}&timeout=45`;
+    const resp = await fetch(url, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        startUrls,
+        pageFunction: `async function pageFunction(context) { try { const j = JSON.parse(context.body); const r = j.chart.result[0]; const m = r.meta; const closes = r.indicators?.quote?.[0]?.close || []; const spark = closes.filter(v => v != null).slice(-30); return { symbol: m.symbol, price: m.regularMarketPrice, prevClose: m.chartPreviousClose || m.previousClose, sparkline: spark }; } catch(e) { return { error: e.message, url: context.request.url }; } }`,
+        maxRequestsPerCrawl: symbols.length + 2,
+        proxyConfiguration: { useApifyProxy: true },
+        additionalMimeTypes: ['application/json'],
+      }),
+      signal: AbortSignal.timeout(60_000),
+    });
+
+    if (!resp.ok) {
+      console.warn(`[Apify Cheerio] HTTP ${resp.status}`);
+      return results;
+    }
+
+    const items: Array<{ symbol?: string; price?: number; prevClose?: number; sparkline?: number[]; error?: string }> = await resp.json();
+    for (const item of items) {
+      if (!item.symbol || !item.price) continue;
+      const change = item.prevClose ? ((item.price - item.prevClose) / item.prevClose) * 100 : 0;
+      results.set(item.symbol, {
+        price: item.price,
+        change,
+        sparkline: item.sparkline ?? [],
+      });
+    }
+    console.log(`[Apify Cheerio] Fetched ${results.size}/${symbols.length} quotes`);
+    cheerioCache.set(cacheKey, { data: results, ts: Date.now() });
+  } catch (err) {
+    console.warn(`[Apify Cheerio] Error:`, (err as Error).message);
+  }
+
+  return results;
+}
+
+// ========================================================================
+// Google Finance fallback for indices & commodities
+// ========================================================================
+
+const GOOGLE_FINANCE_MAP: Record<string, string> = {
+  '^GSPC': '.INX:INDEXSP',
+  '^DJI': '.DJI:INDEXDJX',
+  '^IXIC': '.IXIC:INDEXNASDAQ',
+  '^VIX': 'VIX:INDEXCBOE',
+  'GC=F': 'GC%3DF:NYCOMEX',
+  'CL=F': 'CL%3DF:NYMEX',
+  'NG=F': 'NG%3DF:NYMEX',
+  'SI=F': 'SI%3DF:NYCOMEX',
+  'HG=F': 'HG%3DF:NYCOMEX',
+  '^TASI.SR': 'TASI:TADAWUL',
+  'DFMGI.AE': 'DFMGI:DFM',
+};
+
+async function fetchGoogleFinanceQuote(
+  symbol: string,
+): Promise<{ price: number; change: number; sparkline: number[] } | null> {
+  const gfSymbol = GOOGLE_FINANCE_MAP[symbol];
+  if (!gfSymbol) return null;
+
+  try {
+    const url = `https://www.google.com/finance/quote/${gfSymbol}`;
+    const resp = await fetch(url, {
+      headers: { 'User-Agent': CHROME_UA },
+      signal: AbortSignal.timeout(UPSTREAM_TIMEOUT_MS),
+    });
+    if (!resp.ok) return null;
+
+    const html = await resp.text();
+    const priceMatch = html.match(/data-last-price="([^"]+)"/);
+    const changeMatch = html.match(/data-last-price-change="([^"]+)"/);
+    const changePctMatch = html.match(/data-price-change-percent="([^"]+)"/);
+
+    if (!priceMatch) return null;
+    const price = parseFloat(priceMatch[1]!);
+    const change = changePctMatch ? parseFloat(changePctMatch[1]!) : (changeMatch ? parseFloat(changeMatch[1]!) : 0);
+
+    console.log(`[Google Finance] ${symbol} = ${price} (${change >= 0 ? '+' : ''}${change.toFixed(2)}%)`);
+    return { price, change, sparkline: [] };
+  } catch (err) {
+    console.warn(`[Google Finance] ${symbol} error:`, (err as Error).message);
+    return null;
+  }
+}
+
+export async function fetchGoogleFinanceBatch(
+  symbols: string[],
+): Promise<Map<string, { price: number; change: number; sparkline: number[] }>> {
+  const results = new Map<string, { price: number; change: number; sparkline: number[] }>();
+  // Stagger to avoid being blocked
+  for (const sym of symbols) {
+    const q = await fetchGoogleFinanceQuote(sym);
+    if (q) results.set(sym, q);
+  }
+  return results;
 }
 
 // Yahoo-only symbols: indices and futures not on Finnhub free tier

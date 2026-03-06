@@ -306,6 +306,7 @@ export class App {
       loadAllData: () => this.dataLoader.loadAllData(),
       updateMonitorResults: () => this.dataLoader.updateMonitorResults(),
       loadSecurityAdvisories: () => this.dataLoader.loadSecurityAdvisories(),
+      loadZeroClickOffers: () => this.dataLoader.loadZeroClickOffers(),
     });
 
     this.eventHandlers = new EventHandlerManager(this.state, {
