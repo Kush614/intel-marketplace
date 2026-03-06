@@ -1,3 +1,33 @@
+const BASE_URL = "https://us14.abilityai.dev";
+const CHAT_URL = `${BASE_URL}/api/agents/intel-marketplace-2/chat`;
+const AUTH_HEADERS = {
+  "Content-Type": "application/json",
+  Authorization:
+    "Bearer trinity_mcp_sa-ZnRklsQGjN4LZyO6ylxIts9p5ODH82CQwcRREFdo",
+};
+
+async function trinityPost(message: string): Promise<string> {
+  const res = await fetch(CHAT_URL, {
+    method: "POST",
+    headers: AUTH_HEADERS,
+    body: JSON.stringify({ message }),
+  });
+  if (!res.ok) throw new Error(`HTTP ${res.status}`);
+  const json = await res.json();
+  return json.response ?? json.text ?? JSON.stringify(json);
+}
+
+function tryParseJson<T>(text: string): T | null {
+  try {
+    const match = text.match(/```json\s*([\s\S]*?)```/) ??
+                  text.match(/([\[\{][\s\S]*[\]\}])/);
+    if (match) return JSON.parse(match[1]!);
+    return JSON.parse(text);
+  } catch {
+    return null;
+  }
+}
+
 export interface Seller {
   url: string;
   name: string;
@@ -21,9 +51,14 @@ export interface ChatMessage {
 }
 
 export async function fetchSellers(): Promise<Seller[]> {
-  const res = await fetch("/api/sellers");
-  if (!res.ok) return [];
-  return res.json();
+  try {
+    const text = await trinityPost(
+      "List all available intel sellers in the marketplace. Return as a JSON array.",
+    );
+    return tryParseJson<Seller[]>(text) ?? [];
+  } catch {
+    return [];
+  }
 }
 
 export async function fetchBalance(): Promise<{
@@ -31,9 +66,10 @@ export async function fetchBalance(): Promise<{
   budget: Record<string, unknown>;
 } | null> {
   try {
-    const res = await fetch("/api/balance");
-    if (!res.ok) return null;
-    return res.json();
+    const text = await trinityPost(
+      "What is my current Nevermined balance and plan status? Return as JSON.",
+    );
+    return tryParseJson(text);
   } catch {
     return null;
   }
@@ -50,82 +86,17 @@ export async function streamChat(
   message: string,
   callbacks: StreamCallbacks,
 ): Promise<void> {
-  const res = await fetch("/api/chat", {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ message }),
-  });
-
-  if (!res.ok) {
-    callbacks.onError(`HTTP ${res.status}`);
-    return;
-  }
-
-  const reader = res.body?.getReader();
-  if (!reader) {
-    callbacks.onError("No response body");
-    return;
-  }
-
-  const decoder = new TextDecoder();
-  let buffer = "";
-
-  while (true) {
-    const { done, value } = await reader.read();
-    if (done) break;
-
-    buffer += decoder.decode(value, { stream: true });
-    const lines = buffer.split("\n");
-    buffer = lines.pop() ?? "";
-
-    let currentEvent = "";
-    for (const line of lines) {
-      if (line.startsWith("event:")) {
-        currentEvent = line.slice(6).trim();
-      } else if (line.startsWith("data:")) {
-        const dataStr = line.slice(5).trim();
-        if (!dataStr) continue;
-        try {
-          const data = JSON.parse(dataStr);
-          switch (currentEvent) {
-            case "token":
-              callbacks.onToken(data.text);
-              break;
-            case "tool_use":
-              callbacks.onToolUse(data.name);
-              break;
-            case "done":
-              callbacks.onDone(data.text);
-              break;
-            case "error":
-              callbacks.onError(data.error);
-              break;
-          }
-        } catch {
-          // Skip malformed JSON
-        }
-      }
-    }
+  try {
+    const response = await trinityPost(message);
+    callbacks.onDone(response);
+  } catch (e: unknown) {
+    callbacks.onError(e instanceof Error ? e.message : String(e));
   }
 }
 
 export function connectLogStream(
-  onLog: (entry: LogEntry) => void,
+  _onLog: (entry: LogEntry) => void,
 ): () => void {
-  const es = new EventSource("/api/logs/stream");
-
-  es.addEventListener("log", (e) => {
-    try {
-      const entry: LogEntry = JSON.parse(e.data);
-      onLog(entry);
-    } catch {
-      // Skip malformed entries
-    }
-  });
-
-  es.addEventListener("error", () => {
-    // EventSource auto-reconnects
-  });
-
-  return () => es.close();
+  // Stub — Trinity agent does not expose a log stream
+  return () => {};
 }
