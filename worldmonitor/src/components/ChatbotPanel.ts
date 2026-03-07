@@ -305,12 +305,22 @@ export class ChatbotPanel extends Panel {
     const trinity = trinityResult.status === 'fulfilled' ? trinityResult.value : null;
     const apify = apifyResult.status === 'fulfilled' ? apifyResult.value : null;
 
+    // Filter out unhelpful Trinity responses (generic disclaimers, no real data)
+    const trinityUseful = trinity &&
+      !trinity.includes("I wasn't able to find") &&
+      !trinity.includes("I don't have real-time") &&
+      !trinity.includes("I can't fetch") &&
+      !trinity.includes("I can't browse") &&
+      !trinity.includes("I don't have access to real-time") &&
+      !trinity.includes("check these sources directly") &&
+      !trinity.includes("security-related software engineering");
+
     // If Trinity responded with real content, use it (optionally append search results)
-    if (trinity && !trinity.includes("I wasn't able to find")) {
+    if (trinityUseful) {
       if (apify) {
         return `${trinity}\n\n---\n**Web Search Results:**\n${apify}`;
       }
-      return trinity;
+      return trinity!;
     }
 
     // If only Apify responded, use it
